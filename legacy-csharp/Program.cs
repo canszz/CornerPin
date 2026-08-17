@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -14,11 +15,22 @@ namespace CornerPin;
 
 internal static class Program
 {
+    private static Mutex? _mutex;
+
     [STAThread]
     private static void Main()
     {
         ApplicationConfiguration.Initialize();
+        _mutex = new Mutex(true, @"Local\CornerPinSingleInstance", out bool createdNew);
+        if (!createdNew)
+        {
+            MessageBox.Show(
+                "CornerPin zaten çalışıyor. Sağ altta saatin yanındaki tepsi simgesine bak; gizliyse ^ okuna tıkla.",
+                "CornerPin", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
         Application.Run(new CornerPinContext());
+        GC.KeepAlive(_mutex);
     }
 }
 
@@ -157,6 +169,18 @@ internal sealed class CornerPinContext : ApplicationContext
         _timer = new System.Windows.Forms.Timer { Interval = 400 };
         _timer.Tick += (_, _) => Pin();
         _timer.Start();
+
+        // İlk açılışta "çalışıyorum" balonu (mesaj döngüsü başlayınca göster)
+        var hello = new System.Windows.Forms.Timer { Interval = 600 };
+        hello.Tick += (_, _) =>
+        {
+            hello.Stop();
+            hello.Dispose();
+            _tray.ShowBalloonTip(5000, "CornerPin",
+                "Çalışıyorum, beni tepside bulacaksın. Telegram açıksa birazdan köşeye sabitlenecek.",
+                ToolTipIcon.Info);
+        };
+        hello.Start();
     }
 
     private void BuildCornerMenu()
