@@ -10,14 +10,15 @@ use std::ptr;
 
 use serde::{Deserialize, Serialize};
 use winapi::shared::minwindef::{BOOL, DWORD, HKEY, LPARAM, LRESULT, TRUE, UINT, WPARAM};
-use winapi::shared::windef::{HICON, HWND, POINT, RECT};
+use winapi::shared::windef::{HICON, HMONITOR, HWND, POINT, RECT};
 use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleW};
 use winapi::um::shellapi::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW, SHAppBarMessage, ABE_LEFT, ABE_RIGHT, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
+    ABM_SETPOS, ABN_POSCHANGED, APPBARDATA, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use winapi::um::synchapi::CreateMutexW;
 use winapi::um::winreg::{
@@ -27,25 +28,27 @@ use winapi::um::winnt::{KEY_SET_VALUE, REG_SZ};
 use winapi::um::winuser::*;
 
 const WM_TRAY: UINT = WM_APP + 1;
+const WM_BAR: UINT = WM_APP + 2;
 const IDT_PIN: usize = 1;
 const IDT_HELLO: usize = 2;
 const ID_AUTO: usize = 1000;
 const ID_WIN_BASE: usize = 1100;
-const ID_CORNER_BASE: usize = 1200;
-const ID_SIZE_BASE: usize = 1300;
+const ID_EDGE_BASE: usize = 1200;
+const ID_WIDTH_BASE: usize = 1300;
 const ID_TOPMOST: usize = 1401;
 const ID_STARTUP: usize = 1402;
 const ID_PINNOW: usize = 1403;
 const ID_EXIT: usize = 1404;
 
-const CORNER_NAMES: [&str; 4] = ["Sağ Alt", "Sağ Üst", "Sol Alt", "Sol Üst"];
-const SIZE_NAMES: [&str; 3] = ["Mevcut Boyut", "Tam Yükseklik · 420 px", "Tam Yükseklik · 520 px"];
+const EDGE_NAMES: [&str; 2] = ["Sağ", "Sol"];
+const WIDTH_NAMES: [&str; 3] = ["Mevcut Genişlik", "420 px", "520 px"];
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 struct Settings {
     window_match: String,
-    corner: usize,
-    size_mode: usize,
+    edge: usize,       // 0 = Sağ, 1 = Sol
+    width_mode: usize, // 0 = mevcut, 1 = 420, 2 = 520
     top_most: bool,
     run_at_startup: bool,
 }
@@ -54,8 +57,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             window_match: "Telegram".into(),
-            corner: 0,
-            size_mode: 0,
+            edge: 0,
+            width_mode: 0,
             top_most: true,
             run_at_startup: false,
         }
@@ -65,8 +68,11 @@ impl Default for Settings {
 struct State {
     settings: Settings,
     target: HWND,
+    bar: HWND,
+    bar_registered: bool,
+    bar_rect: RECT,
+    bar_dirty: bool,
     keep_w: i32,
-    keep_h: i32,
     notified: bool,
     menu_windows: Vec<String>,
     settings_path: PathBuf,
@@ -100,6 +106,10 @@ fn checked(b: bool) -> UINT {
     } else {
         0
     }
+}
+
+fn rects_equal(a: &RECT, b: &RECT) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
 }
 
 unsafe fn get_title(h: HWND) -> String {
@@ -168,6 +178,78 @@ unsafe fn balloon(hwnd: HWND, title: &str, msg: &str) {
     Shell_NotifyIconW(NIM_MODIFY, &mut nid);
 }
 
+// Ekranın kenarında kalıcı alan rezerve et (görev çubuğu gibi).
+// Diğer pencereler maximize/snap edildiğinde bu alana giremez.
+unsafe fn appbar_ensure(st: &mut State, mon: HMONITOR, width: i32) -> RECT {
+    let mut mi: MONITORINFO = zeroed();
+    mi.cbSize = size_of::<MONITORINFO>() as DWORD;
+    GetMonitorInfoW(mon, &mut mi);
+    let mut rc = mi.rcMonitor;
+    let right_edge = st.settings.edge == 0;
+    if right_edge {
+        rc.left = rc.right - width;
+    } else {
+        rc.right = rc.left + width;
+    }
+
+    if !st.bar_registered {
+        let mut abd: APPBARDATA = zeroed();
+        abd.cbSize = size_of::<APPBARDATA>() as DWORD;
+        abd.hWnd = st.bar;
+        abd.uCallbackMessage = WM_BAR;
+        SHAppBarMessage(ABM_NEW, &mut abd);
+        st.bar_registered = true;
+        st.bar_dirty = true;
+    }
+
+    if !st.bar_dirty && rects_equal(&st.bar_rect, &rc) {
+        return st.bar_rect;
+    }
+
+    let mut abd: APPBARDATA = zeroed();
+    abd.cbSize = size_of::<APPBARDATA>() as DWORD;
+    abd.hWnd = st.bar;
+    abd.uCallbackMessage = WM_BAR;
+    abd.uEdge = if right_edge { ABE_RIGHT } else { ABE_LEFT };
+    abd.rc = rc;
+    SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+    // QUERYPOS kenarı görev çubuğuna göre kısaltır, genişliği biz yeniden uygularız
+    if right_edge {
+        abd.rc.left = abd.rc.right - width;
+    } else {
+        abd.rc.right = abd.rc.left + width;
+    }
+    SHAppBarMessage(ABM_SETPOS, &mut abd);
+    let rc = abd.rc;
+    SetWindowPos(
+        st.bar,
+        HWND_TOPMOST,
+        rc.left,
+        rc.top,
+        rc.right - rc.left,
+        rc.bottom - rc.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+    st.bar_rect = rc;
+    st.bar_dirty = false;
+    rc
+}
+
+unsafe fn appbar_release(st: &mut State) {
+    if st.bar_registered {
+        let mut abd: APPBARDATA = zeroed();
+        abd.cbSize = size_of::<APPBARDATA>() as DWORD;
+        abd.hWnd = st.bar;
+        SHAppBarMessage(ABM_REMOVE, &mut abd);
+        st.bar_registered = false;
+    }
+    if !st.bar.is_null() {
+        ShowWindow(st.bar, SW_HIDE);
+    }
+    st.bar_rect = zeroed();
+    st.bar_dirty = true;
+}
+
 unsafe fn pin(hwnd: HWND) {
     STATE.with(|s| {
         let mut b = s.borrow_mut();
@@ -178,8 +260,8 @@ unsafe fn pin(hwnd: HWND) {
         if st.target.is_null() || IsWindow(st.target) == 0 {
             st.target = find_target(&st.settings.window_match);
             st.keep_w = 0;
-            st.keep_h = 0;
             if st.target.is_null() {
+                appbar_release(st);
                 let tip = format!("CornerPin · Bekleniyor: {}", truncate(&st.settings.window_match, 20));
                 set_tip(hwnd, &tip);
                 return;
@@ -194,43 +276,30 @@ unsafe fn pin(hwnd: HWND) {
             ShowWindow(st.target, SW_RESTORE);
         }
 
-        let mut r: RECT = zeroed();
-        GetWindowRect(st.target, &mut r);
-        if st.keep_w == 0 {
-            st.keep_w = (r.right - r.left).max(200);
-            st.keep_h = (r.bottom - r.top).max(200);
-        }
-
-        let mut mi: MONITORINFO = zeroed();
-        mi.cbSize = size_of::<MONITORINFO>() as DWORD;
-        GetMonitorInfoW(MonitorFromWindow(st.target, MONITOR_DEFAULTTONEAREST), &mut mi);
-        let wa = mi.rcWork;
-
-        let (mut w, mut h) = (st.keep_w, st.keep_h);
-        match st.settings.size_mode {
-            1 => {
-                w = 420;
-                h = wa.bottom - wa.top;
+        let width = match st.settings.width_mode {
+            1 => 420,
+            2 => 520,
+            _ => {
+                if st.keep_w == 0 {
+                    let mut r: RECT = zeroed();
+                    GetWindowRect(st.target, &mut r);
+                    st.keep_w = (r.right - r.left).max(280);
+                }
+                st.keep_w
             }
-            2 => {
-                w = 520;
-                h = wa.bottom - wa.top;
-            }
-            _ => {}
-        }
-
-        let (x, y) = match st.settings.corner {
-            1 => (wa.right - w, wa.top),
-            2 => (wa.left, wa.bottom - h),
-            3 => (wa.left, wa.top),
-            _ => (wa.right - w, wa.bottom - h),
         };
 
+        let mon = MonitorFromWindow(st.target, MONITOR_DEFAULTTONEAREST);
+        let rc = appbar_ensure(st, mon, width);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+
+        let mut r: RECT = zeroed();
+        GetWindowRect(st.target, &mut r);
         let ex = GetWindowLongW(st.target, GWL_EXSTYLE);
         let is_top = ex & (WS_EX_TOPMOST as i32) != 0;
         let want_top = st.settings.top_most;
-        let pos_diff = (r.left - x).abs() > 1
-            || (r.top - y).abs() > 1
+        let pos_diff = (r.left - rc.left).abs() > 1
+            || (r.top - rc.top).abs() > 1
             || ((r.right - r.left) - w).abs() > 1
             || ((r.bottom - r.top) - h).abs() > 1;
 
@@ -238,8 +307,8 @@ unsafe fn pin(hwnd: HWND) {
             SetWindowPos(
                 st.target,
                 if want_top { HWND_TOPMOST } else { HWND_NOTOPMOST },
-                x,
-                y,
+                rc.left,
+                rc.top,
                 w,
                 h,
                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
@@ -249,9 +318,9 @@ unsafe fn pin(hwnd: HWND) {
         if !st.notified {
             st.notified = true;
             let msg = format!(
-                "{} {} köşesine sabitlendi.",
+                "{} {} kenarına sabitlendi. Diğer pencereler artık onun alanına giremez.",
                 st.settings.window_match,
-                CORNER_NAMES[st.settings.corner.min(3)]
+                EDGE_NAMES[st.settings.edge.min(1)]
             );
             balloon(hwnd, "CornerPin", &msg);
         }
@@ -295,27 +364,27 @@ unsafe fn show_menu(hwnd: HWND) {
         }
         AppendMenuW(menu, MF_POPUP, mwin as usize, wide("Pencere").as_ptr());
 
-        let mcorner = CreatePopupMenu();
-        for (i, name) in CORNER_NAMES.iter().enumerate() {
+        let medge = CreatePopupMenu();
+        for (i, name) in EDGE_NAMES.iter().enumerate() {
             AppendMenuW(
-                mcorner,
-                MF_STRING | checked(st.settings.corner == i),
-                ID_CORNER_BASE + 1 + i,
+                medge,
+                MF_STRING | checked(st.settings.edge == i),
+                ID_EDGE_BASE + 1 + i,
                 wide(name).as_ptr(),
             );
         }
-        AppendMenuW(menu, MF_POPUP, mcorner as usize, wide("Köşe").as_ptr());
+        AppendMenuW(menu, MF_POPUP, medge as usize, wide("Kenar").as_ptr());
 
-        let msize = CreatePopupMenu();
-        for (i, name) in SIZE_NAMES.iter().enumerate() {
+        let mwidth = CreatePopupMenu();
+        for (i, name) in WIDTH_NAMES.iter().enumerate() {
             AppendMenuW(
-                msize,
-                MF_STRING | checked(st.settings.size_mode == i),
-                ID_SIZE_BASE + 1 + i,
+                mwidth,
+                MF_STRING | checked(st.settings.width_mode == i),
+                ID_WIDTH_BASE + 1 + i,
                 wide(name).as_ptr(),
             );
         }
-        AppendMenuW(menu, MF_POPUP, msize as usize, wide("Boyut").as_ptr());
+        AppendMenuW(menu, MF_POPUP, mwidth as usize, wide("Genişlik").as_ptr());
 
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
@@ -357,7 +426,6 @@ unsafe fn show_menu(hwnd: HWND) {
 fn reset_target(st: &mut State) {
     st.target = ptr::null_mut();
     st.keep_w = 0;
-    st.keep_h = 0;
     st.notified = false;
 }
 
@@ -375,18 +443,19 @@ unsafe fn handle_command(hwnd: HWND, cmd: usize) {
         if cmd == ID_AUTO {
             st.settings.window_match = "Telegram".into();
             reset_target(st);
-        } else if cmd > ID_CORNER_BASE && cmd <= ID_CORNER_BASE + 4 {
-            st.settings.corner = cmd - ID_CORNER_BASE - 1;
-        } else if cmd > ID_SIZE_BASE && cmd <= ID_SIZE_BASE + 3 {
-            st.settings.size_mode = cmd - ID_SIZE_BASE - 1;
+        } else if cmd > ID_EDGE_BASE && cmd <= ID_EDGE_BASE + 2 {
+            st.settings.edge = cmd - ID_EDGE_BASE - 1;
+            st.bar_dirty = true;
+        } else if cmd > ID_WIDTH_BASE && cmd <= ID_WIDTH_BASE + 3 {
+            st.settings.width_mode = cmd - ID_WIDTH_BASE - 1;
             st.keep_w = 0;
-            st.keep_h = 0;
+            st.bar_dirty = true;
         } else if cmd == ID_TOPMOST {
             st.settings.top_most = !st.settings.top_most;
         } else if cmd == ID_STARTUP {
             st.settings.run_at_startup = !st.settings.run_at_startup;
         } else if cmd == ID_PINNOW {
-            // sadece pin çağır
+            st.bar_dirty = true;
         } else if cmd >= ID_WIN_BASE && cmd < ID_WIN_BASE + 40 {
             let idx = cmd - ID_WIN_BASE;
             if idx < st.menu_windows.len() {
@@ -492,6 +561,32 @@ unsafe fn create_icon() -> HICON {
     }
 }
 
+// Rezerv penceresi: görünmez (arka plansız), tıklamaları geçirir.
+// Sadece ekran kenarında alan ayırmak için var, üstünde Telegram durur.
+unsafe extern "system" fn bar_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = zeroed();
+            BeginPaint(hwnd, &mut ps);
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_BAR => {
+            if w == ABN_POSCHANGED as WPARAM {
+                STATE.with(|s| {
+                    if let Some(st) = s.borrow_mut().as_mut() {
+                        st.bar_dirty = true;
+                    }
+                });
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
@@ -500,7 +595,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) 
                 balloon(
                     hwnd,
                     "CornerPin",
-                    "Çalışıyorum, beni tepside bulacaksın. Telegram açıksa birazdan köşeye sabitlenecek.",
+                    "Çalışıyorum, beni tepside bulacaksın. Telegram açıksa birazdan kenara sabitlenecek.",
                 );
             } else if w == IDT_PIN {
                 pin(hwnd);
@@ -517,6 +612,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) 
             0
         }
         WM_DESTROY => {
+            STATE.with(|s| {
+                if let Some(st) = s.borrow_mut().as_mut() {
+                    appbar_release(st);
+                }
+            });
             let mut nid: NOTIFYICONDATAW = zeroed();
             nid.cbSize = size_of::<NOTIFYICONDATAW>() as DWORD;
             nid.hWnd = hwnd;
@@ -548,6 +648,8 @@ fn main() {
         }
 
         let hinst = GetModuleHandleW(ptr::null());
+
+        // Ana gizli pencere (tepsi + zamanlayıcı sahibi)
         let class = wide("CornerPinWnd");
         let wnd = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
@@ -574,6 +676,30 @@ fn main() {
             return;
         }
 
+        // Rezerv (appbar) penceresi
+        let barclass = wide("CornerPinBar");
+        let bwnd = WNDCLASSW {
+            lpfnWndProc: Some(bar_proc),
+            hInstance: hinst,
+            lpszClassName: barclass.as_ptr(),
+            ..zeroed()
+        };
+        RegisterClassW(&bwnd);
+        let bar = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            barclass.as_ptr(),
+            wide("CornerPinBar").as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            hinst,
+            ptr::null_mut(),
+        );
+
         let spath = settings_path();
         let settings = load_settings(&spath);
         let run_at_startup = settings.run_at_startup;
@@ -593,8 +719,11 @@ fn main() {
             *s.borrow_mut() = Some(State {
                 settings,
                 target: ptr::null_mut(),
+                bar,
+                bar_registered: false,
+                bar_rect: zeroed(),
+                bar_dirty: true,
                 keep_w: 0,
-                keep_h: 0,
                 notified: false,
                 menu_windows: Vec::new(),
                 settings_path: spath,
@@ -615,4 +744,5 @@ fn main() {
         }
     }
 }
+
 
